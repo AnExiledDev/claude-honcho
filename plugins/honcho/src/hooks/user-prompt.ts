@@ -34,12 +34,48 @@ const SKIP_CONTEXT_PATTERNS = [
 
 const FETCH_TIMEOUT_MS = 4000;
 
+// Max topics fed to the search query — enough to be rich for the server's
+// hybrid (vector + full-text) retrieval without an unbounded query string.
+const MAX_TOPICS = 18;
+
+// Max conclusion lines injected per turn. Was hard-capped at 5, which
+// throttled recall regardless of how many relevant conclusions the server
+// returned; raised to surface more of the now-better-ranked memory while
+// keeping the per-turn context budget bounded.
+const MAX_INJECTED_CONCLUSIONS = 12;
+
+// Low-signal words filtered out of topic extraction (also drops common
+// sentence-initial capitalized words from the proper-noun pass).
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'are', 'was',
+  'were', 'been', 'being', 'has', 'had', 'does', 'did', 'will', 'would',
+  'could', 'should', 'can', 'may', 'might', 'must', 'shall', 'need', 'want',
+  'like', 'just', 'also', 'more', 'some', 'what', 'when', 'where', 'which',
+  'who', 'how', 'why', 'all', 'each', 'every', 'both', 'few', 'most', 'other',
+  'into', 'over', 'such', 'only', 'same', 'than', 'very', 'your', 'make',
+  'take', 'come', 'give', 'look', 'think', 'know', 'please', 'about', 'then',
+  'they', 'them', 'their', 'there', 'here', 'these', 'those', 'because',
+  'while', 'after', 'before', 'again', 'really', 'still', 'going', 'said',
+  'tell', 'told', 'lets', 'okay', 'yeah',
+]);
+
 /**
- * Extract meaningful topics from a prompt for semantic search.
- * Returns terms that are high-signal for conclusion matching.
+ * Extract meaningful topics from a prompt for semantic + full-text search.
+ *
+ * Domain-agnostic and high-signal: pulls structural references (issue/PR
+ * numbers, file paths, quoted strings, structured identifiers, acronyms, and
+ * capitalized proper nouns) that identify *what* a prompt is about regardless
+ * of problem domain — deliberately NOT a fixed technology vocabulary, which
+ * only worked for web-dev prompts. Content words are always merged in too, so
+ * lowercase domain terms (e.g. "reliquary", "foundry") are captured.
  */
-function extractTopics(prompt: string): string[] {
+export function extractTopics(prompt: string): string[] {
   const topics: string[] = [];
+
+  // Issue / PR / ticket references — very high signal, domain-agnostic.
+  // e.g. "#270", "GH-12", "JIRA-431"
+  const issueRefs = prompt.match(/#\d+|\b[A-Z]{2,}-\d+\b/g) || [];
+  topics.push(...issueRefs.slice(0, 5));
 
   // File paths (high signal)
   const filePaths = prompt.match(/[\w\-\/\.]+\.(ts|tsx|js|jsx|py|rs|go|md|json|yaml|yml|toml|sql)/gi) || [];
@@ -49,22 +85,35 @@ function extractTopics(prompt: string): string[] {
   const quoted = prompt.match(/"([^"]+)"/g)?.map(q => q.slice(1, -1)) || [];
   topics.push(...quoted.slice(0, 3));
 
-  // Technical terms
-  const techTerms = prompt.match(/\b(react|vue|svelte|angular|elysia|express|fastapi|django|flask|postgres|redis|docker|kubernetes|bun|node|deno|typescript|python|rust|go|graphql|rest|api|auth|oauth|jwt|stripe|webhook|honcho|mcp|claude|cursor|sentry)\b/gi) || [];
-  topics.push(...[...new Set(techTerms.map(t => t.toLowerCase()))].slice(0, 5));
+  // Structured identifiers — snake_case, kebab-case, dotted.paths, camelCase,
+  // scoped names. High signal for any codebase/project (e.g. "query_documents",
+  // "conduit-bridge", "text-embedding-3-small", "DERIVER_FILTER_NOISE").
+  const identifiers = prompt.match(/\b[a-zA-Z0-9]+(?:[_\-./][a-zA-Z0-9]+)+\b|\b[a-z]+[A-Z][a-zA-Z]+\b/g) || [];
+  topics.push(...[...new Set(identifiers)].slice(0, 6));
+
+  // Acronyms / all-caps tokens (e.g. "MCP", "RRF", "FTS", "API", "DAE").
+  const acronyms = prompt.match(/\b[A-Z]{2,}\d*\b/g) || [];
+  topics.push(...[...new Set(acronyms)].slice(0, 5));
+
+  // Capitalized proper nouns — product / project / component names (e.g.
+  // "Foundry", "Honcho", "Reliquary"), minus common sentence-initial words.
+  const properNouns = (prompt.match(/\b[A-Z][a-z]{2,}\b/g) || []).filter(
+    (w) => !STOPWORDS.has(w.toLowerCase()),
+  );
+  topics.push(...[...new Set(properNouns)].slice(0, 6));
 
   // Error patterns
   const errors = prompt.match(/error[:\s]+[\w\s]+|failed[:\s]+[\w\s]+|exception[:\s]+[\w\s]+/gi) || [];
   topics.push(...errors.slice(0, 2));
 
-  if (topics.length > 0) {
-    return [...new Set(topics)];
-  }
+  // Content words (stopword-filtered) — always merged so lowercase domain
+  // terms are captured, not only when no structural signal exists.
+  const words = (prompt.toLowerCase().match(/\b[a-z]{4,}\b/g) || []).filter(
+    (w) => !STOPWORDS.has(w),
+  );
+  topics.push(...[...new Set(words)].slice(0, 8));
 
-  // Fallback: meaningful words >3 chars minus stopwords
-  const stopwords = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'are', 'was', 'were', 'been', 'being', 'has', 'had', 'does', 'did', 'will', 'would', 'could', 'should', 'can', 'may', 'might', 'must', 'shall', 'need', 'want', 'like', 'just', 'also', 'more', 'some', 'what', 'when', 'where', 'which', 'who', 'how', 'why', 'all', 'each', 'every', 'both', 'few', 'most', 'other', 'into', 'over', 'such', 'only', 'same', 'than', 'very', 'your', 'make', 'take', 'come', 'give', 'look', 'think', 'know']);
-  const words = prompt.toLowerCase().match(/\b[a-z]{4,}\b/g) || [];
-  return [...new Set(words.filter(w => !stopwords.has(w)))].slice(0, 10);
+  return [...new Set(topics)].slice(0, MAX_TOPICS);
 }
 
 function shouldSkipContextRetrieval(prompt: string): boolean {
@@ -257,9 +306,9 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
       contextResult = await contextPeer.context({
         ...(contextTarget ? { target: contextTarget } : {}),
         searchQuery,
-        searchTopK: 5,
+        searchTopK: 10,
         searchMaxDistance: 0.7,
-        maxConclusions: 15,
+        maxConclusions: 20,
         includeMostFrequent: true,
       });
       logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)}`, Date.now() - startTime, true);
@@ -273,7 +322,7 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
   if (!contextResult) {
     contextResult = await contextPeer.context({
       ...(contextTarget ? { target: contextTarget } : {}),
-      maxConclusions: 15,
+      maxConclusions: 20,
       includeMostFrequent: true,
     });
     logApiCall(contextLabel, "GET", `static context`, Date.now() - startTime, true);
@@ -295,7 +344,7 @@ function formatCachedContext(context: any, peerName: string): { parts: string[];
 
   if (typeof rep === "string" && rep.trim()) {
     const lines = rep.split("\n").filter((l: string) => l.trim() && !l.startsWith("#"));
-    const selected = lines.slice(0, 5);
+    const selected = lines.slice(0, MAX_INJECTED_CONCLUSIONS);
     conclusionCount = selected.length;
     const summary = selected.map((l: string) => l.replace(/^\[.*?\]\s*/, "").replace(/^- /, "")).join("; ");
     if (summary) parts.push(`Relevant conclusions: ${summary}`);
