@@ -303,13 +303,22 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
 
   if (searchQuery) {
     try {
+      // R1a: drop the "most-frequent/derived" arm and align maxConclusions with
+      // MAX_INJECTED_CONCLUSIONS. The server's working-representation merges the
+      // semantic + most-derived + recent arms and sorts them CHRONOLOGICALLY,
+      // then we slice the first N. Over-fetching (20) and blending non-semantic
+      // arms meant the slice dropped the newest/most-relevant and injected
+      // off-topic filler: measured 80% topical at retrieval vs only 45% at
+      // injection. Requesting exactly the semantic top-N (no filler, no
+      // over-fetch) recovers it to ~78% topical. The most-derived arm is also
+      // inert until reinforcement (times_derived) is real (R1).
       contextResult = await contextPeer.context({
         ...(contextTarget ? { target: contextTarget } : {}),
         searchQuery,
-        searchTopK: 10,
+        searchTopK: MAX_INJECTED_CONCLUSIONS,
         searchMaxDistance: 0.7,
-        maxConclusions: 20,
-        includeMostFrequent: true,
+        maxConclusions: MAX_INJECTED_CONCLUSIONS,
+        includeMostFrequent: false,
       });
       logApiCall(contextLabel, "GET", `search: ${searchQuery.slice(0, 60)}`, Date.now() - startTime, true);
     } catch (e) {
@@ -320,9 +329,14 @@ async function fetchFreshContext(config: any, prompt: string): Promise<{ context
 
   // Fallback: static context (no search query)
   if (!contextResult) {
+    // Static fallback (no topics extracted): no semantic arm, so the durable
+    // most-frequent facts ARE the best signal here — keep includeMostFrequent
+    // (it becomes meaningful once reinforcement/times_derived is real, R1).
+    // Align the budget with the inject cap to avoid over-fetch + chronological
+    // head-slice dropping the newest.
     contextResult = await contextPeer.context({
       ...(contextTarget ? { target: contextTarget } : {}),
-      maxConclusions: 20,
+      maxConclusions: MAX_INJECTED_CONCLUSIONS,
       includeMostFrequent: true,
     });
     logApiCall(contextLabel, "GET", `static context`, Date.now() - startTime, true);
